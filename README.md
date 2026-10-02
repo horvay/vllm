@@ -7,14 +7,17 @@ vLLM on an Intel Arc Pro B70 (XPU) serving Gemma 4 31B (EXL3) to many concurrent
 | --- | --- | --- | --- |
 | 4 | 20.3 s → 1.2 s | 14 → 23.5 tok/s | 25 → 33 tok/s |
 | 6 | 19.4 s → 15.3 s | 8.7 → 21.7 tok/s | 24 → 41.5 tok/s |
-| 8 | 66.8 s → 10.6 s | 7.9 → 21.4 tok/s | 28 → 58 tok/s |
+| 8 | 66.8 s → 7.2 s | 7.9 → 21.4 tok/s | 28 → 57 tok/s |
+| 10 | 104 s → 9.8 s | 8.7 → 20.1 tok/s | 24 → 57 tok/s |
+| 12 | 136 s → 18 s | 9.0 → 20.1 tok/s | 27.5 → 67 tok/s |
 
-Setup: about 19.5k tokens of context per session, `--max-num-seqs 4`, 16 GiB RAM cache; baseline = default `OffloadingConnector` + default sliding-window caching. 10 and 12 sessions: pending.
+Setup: about 19.5k tokens of context per session, `--max-num-seqs 4`, 16 GiB RAM cache; baseline = default `OffloadingConnector` + default sliding-window caching.
 
 **Changes**
 
 - `c22f9d8`: `VLLM_PREFIX_CACHE_REPLAY_SLACK_TOKENS` keeps sliding-window tails up to that many tokens before the replay boundary, so follow-up chat turns still hit the prefix cache under `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=0`.
 - `46e4f7b`: an XPU copy backend (`swap_blocks_batch`) for `SimpleCPUOffloadConnector`, including its lazy mode, which previously needed CUDA/HIP batch copies.
+- `af5173e`: on XPU the CPU cache is pinned in power-of-two chunks (24 GiB = 16 + 8), since PyTorch rounds each pinned allocation up to a power of two.
 
 **Enabling it**
 
@@ -25,7 +28,7 @@ vllm serve ... \
   --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":<bytes>,"lazy_offload":true}}'
 ```
 
-Keep `cpu_bytes_to_use` well under free RAM; on XPU it is rounded down to a power of two.
+Keep `cpu_bytes_to_use` well under free RAM: it is pinned at startup and cannot be swapped.
 
 Tested on a real B70: vLLM's prefix-caching and KV-cache-manager tests plus a new XPU copy-backend test pass, and temperature-0 outputs match within normal prefix-cache noise. Not yet proposed upstream.
 
