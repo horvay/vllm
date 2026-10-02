@@ -131,43 +131,60 @@ class DmaCopyBackend:
             events_list.append((event_idx, event))
 
 
+# (first block of each segment, base address of each segment)
+_Segments = tuple[np.ndarray, np.ndarray]
+
+
+def _segments(cache: torch.Tensor | list[torch.Tensor]) -> tuple[_Segments, int]:
+    parts = cache if isinstance(cache, list) else [cache]
+    bpb = parts[0].stride(0) * parts[0].element_size()
+    assert all(p.stride(0) * p.element_size() == bpb for p in parts)
+    starts = np.cumsum([0] + [p.shape[0] for p in parts[:-1]]).astype(np.uint64)
+    bases = np.array([p.data_ptr() for p in parts], dtype=np.uint64)
+    return (starts, bases), bpb
+
+
+def _block_ptrs(segments: _Segments, ids: np.ndarray, bpb: int) -> np.ndarray:
+    starts, bases = segments
+    seg = np.searchsorted(starts, ids, side="right") - 1
+    return bases[seg] + (ids - starts[seg]) * np.uint64(bpb)
+
+
 class XpuCopyBackend:
     """Intel XPU copy backend (background thread).
 
     XPU has no cuMemcpyBatchAsync; vLLM's ``swap_blocks_batch`` op drives the
     copy engine with one raw pointer copy per (layer, block), the path the
-    OffloadingConnector already uses on XPU. Same interface as DmaCopyBackend.
+    OffloadingConnector already uses on XPU. Same interface as DmaCopyBackend,
+    except that a cache may be a list of segments (consecutive runs of blocks
+    in separate buffers), which the XPU worker uses for its pinned chunks.
     """
 
     def __init__(self) -> None:
-        self._store_params: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-        self._load_params: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._store_params: list[tuple[_Segments, _Segments, int]] | None = None
+        self._load_params: list[tuple[_Segments, _Segments, int]] | None = None
         self._queue: queue.SimpleQueue | None = None
         self._thread: threading.Thread | None = None
         self._shutdown: bool = False
 
     @staticmethod
     def _params(
-        src_caches: dict[str, torch.Tensor], dst_caches: dict[str, torch.Tensor]
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        src_caches: dict[str, torch.Tensor | list[torch.Tensor]],
+        dst_caches: dict[str, torch.Tensor | list[torch.Tensor]],
+    ) -> list[tuple[_Segments, _Segments, int]]:
         assert list(src_caches.keys()) == list(dst_caches.keys())
-        src_bases, dst_bases, bpb = [], [], []
+        layers = []
         for s, d in zip(src_caches.values(), dst_caches.values()):
-            s_bpb = s.stride(0) * s.element_size()
-            assert s_bpb == d.stride(0) * d.element_size()
-            src_bases.append(s.data_ptr())
-            dst_bases.append(d.data_ptr())
-            bpb.append(s_bpb)
-        return (
-            np.array(src_bases, dtype=np.uint64),
-            np.array(dst_bases, dtype=np.uint64),
-            np.array(bpb, dtype=np.uint64),
-        )
+            src, s_bpb = _segments(s)
+            dst, d_bpb = _segments(d)
+            assert s_bpb == d_bpb
+            layers.append((src, dst, s_bpb))
+        return layers
 
     def init(
         self,
         gpu_caches: dict[str, torch.Tensor],
-        cpu_caches: dict[str, torch.Tensor],
+        cpu_caches: dict[str, torch.Tensor | list[torch.Tensor]],
         device: torch.device,
         load_stream: torch.Stream,
         store_stream: torch.Stream,
@@ -232,12 +249,17 @@ class XpuCopyBackend:
             n = len(src_blocks)
             tables: tuple[torch.Tensor, ...] = ()
             if n > 0:
-                src_bases, dst_bases, bpb = params
                 src_ids = np.array(src_blocks, dtype=np.uint64)
                 dst_ids = np.array(dst_blocks, dtype=np.uint64)
-                src_all = (src_bases[:, None] + src_ids[None, :] * bpb[:, None]).ravel()
-                dst_all = (dst_bases[:, None] + dst_ids[None, :] * bpb[:, None]).ravel()
-                sizes = np.repeat(bpb, n)
+                src_all = np.concatenate(
+                    [_block_ptrs(src, src_ids, bpb) for src, _, bpb in params]
+                )
+                dst_all = np.concatenate(
+                    [_block_ptrs(dst, dst_ids, bpb) for _, dst, bpb in params]
+                )
+                sizes = np.repeat(
+                    np.array([bpb for _, _, bpb in params], dtype=np.uint64), n
+                )
                 tables = tuple(
                     torch.from_numpy(np.ascontiguousarray(a)).view(torch.uint64)
                     for a in (src_all, dst_all, sizes)

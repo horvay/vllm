@@ -94,3 +94,52 @@ def test_store_waits_for_compute_write():
             assert torch.all(cpu["a"][4] == value)
     finally:
         backend.shutdown()
+
+
+def test_pow2_chunks_cover_the_capacity_without_rounding_up():
+    from vllm.v1.simple_kv_offload.worker import pow2_chunks
+
+    gib = 1 << 30
+    assert pow2_chunks(24 * gib) == [16 * gib, 8 * gib]
+    assert pow2_chunks(25 * gib + gib // 2) == [16 * gib, 8 * gib, gib]
+    assert pow2_chunks(16 * gib) == [16 * gib]
+    assert pow2_chunks(gib // 2 + 5) == [gib // 2]
+    assert pow2_chunks(0) == []
+
+
+def test_roundtrip_across_cpu_segments():
+    """A CPU cache split into pinned chunks: blocks on both sides of a chunk
+    boundary land where the scheduler's block ids say."""
+    device = torch.device("xpu", 0)
+    gpu = {
+        "a": torch.randint(-128, 127, (NUM_BLOCKS, 4096), dtype=torch.int8, device=device),
+        "b": torch.randint(-128, 127, (NUM_BLOCKS, 1536), dtype=torch.int8, device=device),
+    }
+    sizes = [10, 6]  # CPU blocks 0-9 in the first chunk, 10-15 in the second
+    cpu: dict = {"a": [], "b": []}
+    for n in sizes:
+        pool = torch.zeros(n * (4096 + 1536), dtype=torch.int8, pin_memory=True)
+        cpu["a"].append(pool[: n * 4096].view(n, 4096))
+        cpu["b"].append(pool[n * 4096 :].view(n, 1536))
+    original = {k: v.clone() for k, v in gpu.items()}
+    backend = XpuCopyBackend()
+    backend.init(gpu, cpu, device, current_platform.Stream(), current_platform.Stream())
+    try:
+        stores: list = []
+        cpu_ids = [8, 9, 10, 15]
+        backend.launch_copy([1, 2, 3, 4], cpu_ids, is_store=True, event_idx=0, events_list=stores)
+        _wait(stores, 0)
+        for k in gpu:
+            flat = torch.cat(cpu[k])
+            assert torch.equal(flat[cpu_ids], original[k][[1, 2, 3, 4]].cpu())
+
+        for k in gpu:
+            gpu[k].zero_()
+        torch.xpu.synchronize()
+        loads: list = []
+        backend.launch_copy(cpu_ids, [20, 21, 22, 23], is_store=False, event_idx=0, events_list=loads)
+        _wait(loads, 0)
+        for k in gpu:
+            assert torch.equal(gpu[k][[20, 21, 22, 23]].cpu(), original[k][[1, 2, 3, 4]].cpu())
+    finally:
+        backend.shutdown()

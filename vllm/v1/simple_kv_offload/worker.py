@@ -22,6 +22,23 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_MIN_PINNED_CHUNK = 1 << 30
+
+
+def pow2_chunks(capacity_bytes: int, min_chunk: int = _MIN_PINNED_CHUNK) -> list[int]:
+    """Split a capacity into power-of-two chunk sizes, largest first, each at
+    least ``min_chunk`` (the remainder below it is dropped): 24 GiB -> 16 + 8.
+    A capacity below ``min_chunk`` is a single chunk of its largest power of two."""
+    if capacity_bytes < min_chunk:
+        return [1 << (capacity_bytes.bit_length() - 1)] if capacity_bytes > 0 else []
+    chunks = []
+    remaining = capacity_bytes
+    while remaining >= min_chunk:
+        chunk = 1 << (remaining.bit_length() - 1)
+        chunks.append(chunk)
+        remaining -= chunk
+    return chunks
+
 
 class SimpleCPUOffloadWorker:
     """Worker-side handler for CPU offloading transfers."""
@@ -146,13 +163,21 @@ class SimpleCPUOffloadWorker:
         ]
         total_bytes_per_block = sum(per_tensor_bpb)
 
-        capacity_bytes = self.cpu_capacity_bytes
+        chunk_blocks: list[int] = []
         if current_platform.is_xpu():
             # XPU pins through PyTorch's caching host allocator, which rounds
-            # an allocation up to a power of two. The cache is one pinned
-            # buffer, kept within the largest power of two that fits.
-            capacity_bytes = 1 << (capacity_bytes.bit_length() - 1)
-        self.num_cpu_blocks = max(1, capacity_bytes // total_bytes_per_block)
+            # an allocation up to a power of two. The cache is built from
+            # power-of-two chunks instead (24 GiB = 16 + 8), none of it wasted.
+            chunk_blocks = [
+                chunk // total_bytes_per_block
+                for chunk in pow2_chunks(self.cpu_capacity_bytes)
+            ]
+            chunk_blocks = [n for n in chunk_blocks if n > 0] or [1]
+            self.num_cpu_blocks = sum(chunk_blocks)
+        else:
+            self.num_cpu_blocks = max(
+                1, self.cpu_capacity_bytes // total_bytes_per_block
+            )
 
         logger.info(
             "SimpleCPUOffloadWorker: %d unique GPU KV tensors, "
@@ -171,21 +196,29 @@ class SimpleCPUOffloadWorker:
         self.gpu_kv_caches = unique_gpu_caches
         self.cpu_kv_caches = {}
         if current_platform.is_xpu():
-            # No cudaHostRegister on XPU: one pinned buffer, sliced per tensor.
-            pool = torch.zeros(
-                self.num_cpu_blocks * total_bytes_per_block,
-                dtype=torch.int8,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
-            offset = 0
-            for name, gpu_tensor in unique_gpu_caches.items():
-                cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
-                nbytes = self.num_cpu_blocks * gpu_tensor.stride(0) * gpu_tensor.element_size()
-                self.cpu_kv_caches[name] = (
-                    pool[offset : offset + nbytes].view(gpu_tensor.dtype).view(cpu_shape)
+            # No cudaHostRegister on XPU: each chunk is one pinned buffer
+            # holding a run of CPU blocks for every tensor; a tensor's cache is
+            # its list of per-chunk segments, in block order.
+            segments: dict[str, list[torch.Tensor]] = {
+                name: [] for name in unique_gpu_caches
+            }
+            for n_blocks in chunk_blocks:
+                pool = torch.zeros(
+                    n_blocks * total_bytes_per_block,
+                    dtype=torch.int8,
+                    device="cpu",
+                    pin_memory=pin_memory,
                 )
-                offset += nbytes
+                offset = 0
+                for name, gpu_tensor in unique_gpu_caches.items():
+                    bpb = gpu_tensor.stride(0) * gpu_tensor.element_size()
+                    segments[name].append(
+                        pool[offset : offset + n_blocks * bpb]
+                        .view(gpu_tensor.dtype)
+                        .view((n_blocks,) + gpu_tensor.shape[1:])
+                    )
+                    offset += n_blocks * bpb
+            self.cpu_kv_caches = segments  # type: ignore[assignment]
         else:
             for name, gpu_tensor in unique_gpu_caches.items():
                 cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
