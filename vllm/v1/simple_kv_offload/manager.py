@@ -11,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
@@ -196,7 +197,19 @@ class SimpleCPUOffloadScheduler:
             else sum(t.size for t in gpu_config.kv_cache_tensors)
         )
         num_gpu_blocks = gpu_config.num_blocks
-        num_cpu_blocks = max(1, num_gpu_blocks * cpu_capacity_bytes // gpu_total_bytes)
+        if current_platform.is_xpu():
+            # The XPU worker pins the cache in power-of-two chunks, each holding
+            # a whole number of blocks; count blocks the same way so every CPU
+            # block id the scheduler hands out exists on the worker.
+            from vllm.v1.simple_kv_offload.worker import chunk_block_counts
+
+            num_cpu_blocks = sum(
+                chunk_block_counts(cpu_capacity_bytes, gpu_total_bytes // num_gpu_blocks)
+            )
+        else:
+            num_cpu_blocks = max(
+                1, num_gpu_blocks * cpu_capacity_bytes // gpu_total_bytes
+            )
         # Create CPU kv_cache_tensors mirroring GPU by scaling size proportionally.
         cpu_tensors = [
             KVCacheTensor(

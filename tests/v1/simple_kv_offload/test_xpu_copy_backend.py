@@ -143,3 +143,36 @@ def test_roundtrip_across_cpu_segments():
             assert torch.equal(gpu[k][[20, 21, 22, 23]].cpu(), original[k][[1, 2, 3, 4]].cpu())
     finally:
         backend.shutdown()
+
+
+@pytest.mark.parametrize("capacity_gib", [16, 24, 25.5, 0.75])
+def test_scheduler_and_worker_agree_on_cpu_blocks(capacity_gib):
+    """The scheduler's CPU block pool must not be larger than the blocks the
+    worker pins, or a block id past the last chunk would be copied to."""
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+    from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
+    from vllm.v1.simple_kv_offload.worker import chunk_block_counts
+
+    num_gpu_blocks = 1000
+    per_block = [2_621_440, 2_621_440, 655_360, 917_504]  # uneven layers
+    gpu_config = KVCacheConfig(
+        num_blocks=num_gpu_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(size=b * num_gpu_blocks, shared_by=[f"l{i}"])
+            for i, b in enumerate(per_block)
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [f"l{i}" for i in range(len(per_block))],
+                FullAttentionSpec(block_size=64, num_kv_heads=1, head_size=1, dtype=torch.float16),
+            )
+        ],
+    )
+    capacity = int(capacity_gib * (1 << 30))
+    cpu_config = SimpleCPUOffloadScheduler._derive_cpu_config(gpu_config, capacity)
+    assert cpu_config.num_blocks == sum(chunk_block_counts(capacity, sum(per_block)))

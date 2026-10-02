@@ -40,6 +40,13 @@ def pow2_chunks(capacity_bytes: int, min_chunk: int = _MIN_PINNED_CHUNK) -> list
     return chunks
 
 
+def chunk_block_counts(capacity_bytes: int, bytes_per_block: int) -> list[int]:
+    """CPU blocks per pinned chunk on XPU. The scheduler sizes its CPU block
+    pool from the same counts, so every block id it uses exists here."""
+    counts = [chunk // bytes_per_block for chunk in pow2_chunks(capacity_bytes)]
+    return [n for n in counts if n > 0] or [1]
+
+
 class SimpleCPUOffloadWorker:
     """Worker-side handler for CPU offloading transfers."""
 
@@ -168,11 +175,9 @@ class SimpleCPUOffloadWorker:
             # XPU pins through PyTorch's caching host allocator, which rounds
             # an allocation up to a power of two. The cache is built from
             # power-of-two chunks instead (24 GiB = 16 + 8), none of it wasted.
-            chunk_blocks = [
-                chunk // total_bytes_per_block
-                for chunk in pow2_chunks(self.cpu_capacity_bytes)
-            ]
-            chunk_blocks = [n for n in chunk_blocks if n > 0] or [1]
+            chunk_blocks = chunk_block_counts(
+                self.cpu_capacity_bytes, total_bytes_per_block
+            )
             self.num_cpu_blocks = sum(chunk_blocks)
         else:
             self.num_cpu_blocks = max(
