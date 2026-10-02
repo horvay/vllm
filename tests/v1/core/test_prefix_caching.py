@@ -3386,6 +3386,69 @@ def test_hybrid_local_kv_retention_latest_only_reuses_replay_boundary(monkeypatc
     assert len(computed_blocks.blocks[1]) == 0
 
 
+@pytest.mark.parametrize("slack_tokens, expected_hit", [(0, 0), (32, 64)])
+def test_hybrid_local_kv_retention_replay_slack_serves_follow_up(
+    monkeypatch, slack_tokens: int, expected_hit: int
+):
+    """A follow-up turn that diverges just before the replay boundary hits the
+    tail that VLLM_PREFIX_CACHE_REPLAY_SLACK_TOKENS keeps."""
+    import vllm.v1.core.single_type_kv_cache_manager as stkcm
+
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "0")
+    monkeypatch.setattr(stkcm, "REPLAY_SLACK_TOKENS", slack_tokens)
+    block_size = 8
+    kv_cache_config = KVCacheConfig(
+        num_blocks=100,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer1"],
+                FullAttentionSpec(
+                    block_size=4 * block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float16,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["layer2"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=block_size,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    # A 128-token prompt: the replay boundary keeps the tail at 96; a 32-token
+    # slack also keeps the tail at 64.
+    token_ids = [i for i in range(16) for _ in range(block_size)]
+    req0 = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, _, _ = manager.get_computed_blocks(req0)
+    assert manager.allocate_slots(
+        req0,
+        len(token_ids),
+        len(computed_blocks.blocks[0]) * block_size,
+        computed_blocks,
+    )
+    manager.free(req0)
+
+    # The follow-up shares the first 90 tokens, then says something new.
+    follow_up = token_ids[:90] + [1000 + i for i in range(38)]
+    req1 = make_request("1", follow_up, block_size, sha256)
+    _, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == expected_hit
+
+
 def test_hybrid_local_kv_retention_mtp_reuses_latest_boundary(monkeypatch):
     """Verify MTP/EAGLE SWA retention keeps the extra proof block.
 

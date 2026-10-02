@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -31,6 +32,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+# Under sparse retention (VLLM_PREFIX_CACHE_RETENTION_INTERVAL), also keep the
+# sliding-window tails ending up to this many tokens before a prompt's replay
+# boundary, so a follow-up turn that diverges just before it still hits.
+REPLAY_SLACK_TOKENS = int(os.environ.get("VLLM_PREFIX_CACHE_REPLAY_SLACK_TOKENS", "0"))
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -427,7 +433,18 @@ class SingleTypeKVCacheManager(ABC):
         # Token boundaries whose reachable tail must be retained under sparse
         # retention: the replay boundary (``num_prompt - 1``, capped by
         # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        replay_boundary = request.num_prompt_tokens - 1
+        reachable_boundaries = [replay_boundary]
+        # A follow-up chat turn diverges a little before the replay boundary
+        # (where the assistant reply starts), and its hit rounds down to the
+        # scheduler block; keep the tails of the blocks that slack can reach.
+        if retention_interval is not None and REPLAY_SLACK_TOKENS > 0:
+            step = self.scheduler_block_size
+            reachable_boundaries.extend(
+                replay_boundary - offset
+                for offset in range(step, REPLAY_SLACK_TOKENS + step, step)
+                if replay_boundary - offset > 0
+            )
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
 
