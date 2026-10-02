@@ -1,15 +1,15 @@
 <!-- markdownlint-disable MD001 MD041 -->
 ## About this fork
 
-This is a fork of vLLM for Neverending Quest (NQ), a local AI tabletop Game Master app. NQ serves Gemma 4 31B (EXL3) on an Intel Arc Pro B70 to several players at once. The branch `nq/xpu-kv-offload` is based on upstream commit [`568afb3`](https://github.com/vllm-project/vllm/commit/568afb3a13806beb53bb2e6bd518269357b237c0), the commit the exl3xpu image (`ghcr.io/0xsero/exl3xpu`, an Intel Arc / XPU build of vLLM with EXL3 kernels) was built from. It adds two commits on top.
+This fork runs vLLM on an Intel Arc Pro B70 (Xe2 / Battlemage, 32 GB) through XPU, serving Gemma 4 31B (EXL3) to several concurrent long-context chat sessions. It is used with the exl3xpu image (`ghcr.io/0xsero/exl3xpu`, an Intel Arc / XPU build of vLLM with EXL3 kernels). This branch is based on upstream commit [`568afb3`](https://github.com/vllm-project/vllm/commit/568afb3a13806beb53bb2e6bd518269357b237c0), the commit that image was built from. It adds two commits on top.
 
-**1. Keep sliding-window tails just before the replay boundary** (`c22f9d8`, `vllm/v1/core/single_type_kv_cache_manager.py`). Adds the environment variable `VLLM_PREFIX_CACHE_REPLAY_SLACK_TOKENS` (default `0`, which changes nothing). It only acts when upstream's `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` is set. With a retention interval of `0`, a sliding-window group caches only the tail at a prompt's replay boundary (`num_prompt_tokens - 1`). A follow-up chat turn diverges a little earlier, where the assistant reply starts, and its prefix hit rounds down to the scheduler block. When that lands one block earlier, no tail matches and the whole prompt is recomputed. The slack also keeps the tails ending up to that many tokens before the boundary, one per scheduler block. NQ uses `256`.
+**1. Keep sliding-window tails just before the replay boundary** (`c22f9d8`, `vllm/v1/core/single_type_kv_cache_manager.py`). Adds the environment variable `VLLM_PREFIX_CACHE_REPLAY_SLACK_TOKENS` (default `0`, which changes nothing). It only acts when upstream's `VLLM_PREFIX_CACHE_RETENTION_INTERVAL` is set. With a retention interval of `0`, a sliding-window group caches only the tail at a prompt's replay boundary (`num_prompt_tokens - 1`). A follow-up chat turn diverges a little earlier, where the assistant reply starts, and its prefix hit rounds down to the scheduler block. When that lands one block earlier, no tail matches and the whole prompt is recomputed. The slack also keeps the tails ending up to that many tokens before the boundary, one per scheduler block.
 
 **2. SimpleCPUOffloadConnector copy backend for Intel XPU** (`46e4f7b`, `vllm/v1/simple_kv_offload/copy_backend.py` and `worker.py`). `SimpleCPUOffloadConnector`, including its lazy mode, copied blocks only through `cuMemcpyBatchAsync` / `hipMemcpyBatchAsync`. On XPU it now uses a new `XpuCopyBackend`, which runs vLLM's `swap_blocks_batch` op (the copy path `OffloadingConnector` already uses on XPU) on a background thread. XPU has no `cudaHostRegister`, so the CPU cache is one pinned buffer sliced per KV tensor, capped to the largest power of two that fits the requested size (PyTorch's caching host allocator rounds pinned allocations up to a power of two). Load and store streams come from `current_platform`.
 
 **Why both matter for Gemma 4.** 50 of Gemma 4's 60 layers use a 1024-token sliding window, about 90% of the per-token KV cache. At vLLM's defaults every past sliding-window block stays cached and goes to the recent end of the eviction queue, so a new long prompt pushes other conversations' useful blocks off the GPU. The default `OffloadingConnector` also copies every chunk to RAM as it is computed: about 340 KB per token measured, against about 1.2 GB actually needed per 20k-token context. With `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=0` and the replay slack, only reusable tails are cached. With the lazy `SimpleCPUOffloadConnector`, blocks move to RAM only when they are about to leave the GPU, and uncached blocks are never moved.
 
-**How NQ enables it:**
+**Enabling it:**
 
 ```bash
 VLLM_PREFIX_CACHE_RETENTION_INTERVAL=0 \
@@ -18,18 +18,19 @@ vllm serve ... \
   --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":<bytes>,"lazy_offload":true}}'
 ```
 
-NQ's installer overlays only the three changed files onto the exl3xpu image, pinned to commit `46e4f7b7adbc1fadb2ca112574d7094b671ac807` and checked by SHA-256, after confirming that the image's copies match upstream at the base commit.
+A slack of 256 tokens is recommended: it covers a chat template's assistant-turn opening plus a short thinking prefill. Keep the pinned CPU cache (`cpu_bytes_to_use`) well under the host's free RAM. On a 62 GB host, a 30 GiB pinned cache with the default offloader drove free memory to about 2 GiB and crashed the `xe` kernel driver's shrinker (a NULL dereference in `kswapd0`). The XPU path in this fork also rounds the cache down to a power of two.
 
 **Testing.** The new tests (a replay-slack test in `tests/v1/core/test_prefix_caching.py` and `tests/v1/simple_kv_offload/test_xpu_copy_backend.py`), together with the rest of `tests/v1/core/test_prefix_caching.py` and `tests/v1/core/test_single_type_kv_cache_manager.py`, pass inside the exl3xpu image on a real Arc B70. The `tests/v1/simple_kv_offload/test_scheduler.py` tests that download `facebook/opt-125m` from Hugging Face fail offline, identically on unmodified vLLM. In a real-engine check at temperature 0, fresh runs are bit-identical. A prompt restored from RAM matched the GPU-cached result within the noise floor that GPU prefix caching itself shows on this engine (up to about 0.14 logprob drift, because the fp8 KV cache is read back while a fresh prefill attends at full precision).
 
-**Measured effect.** Early load-test numbers: 4 simulated players at about 19.5k tokens of context each, Arc B70, 4 sequences, 16 GiB RAM cache, compared with the default offloader. The full ramp results are still pending.
+**Measured effect.** Setup: a simulated multi-session chat workload in which each session holds about 19.5k tokens of context and sessions take turns with 20-45 s pauses; Arc Pro B70; `--max-num-seqs 4`; 16 GiB RAM cache; Gemma 4 31B at EXL3 4.0 bpw with an MTP drafter. The baseline is vLLM's default `OffloadingConnector` with default sliding-window caching. The fork run uses the lazy `SimpleCPUOffloadConnector`, a retention interval of `0` and a slack of `256`.
 
-| Metric | Default offloader | This fork |
-| --- | --- | --- |
-| Median time to first token | 20.3 s | 1.4 s |
-| Per-player decode speed | 14 tok/s | 24 tok/s |
-| GPU prefix cache hit rate | 7% | 54% |
-| RAM cache hit rate | 15% | 43% |
+| Concurrent sessions | Median time to first token (baseline → fork) | Median decode per session | Total generation |
+| --- | --- | --- | --- |
+| 4 | 20.3 s → 1.2 s | 14 → 23.5 tok/s | 25 → 33 tok/s |
+| 6 | 19.4 s → 15.3 s | 8.7 → 21.7 tok/s | 24 → 41.5 tok/s |
+| 8 | 66.8 s → 10.6 s | 7.9 → 21.4 tok/s | 28 → 58 tok/s |
+
+Results for 10 and 12 sessions are still to come. At 4 sessions the GPU prefix-cache hit rate went from 7% to 54%. At 8 sessions the GPU held few contexts (3% hit rate), but the RAM tier served 94% of returning prefix lookups. Preemptions dropped from 40 to 2 over the run. The waits at 6-8 sessions are mostly queueing for one of the 4 sequence slots, not recomputation.
 
 **Upstream status.** Not proposed upstream yet. Before an upstream PR, `VLLM_PREFIX_CACHE_REPLAY_SLACK_TOKENS` should move into `vllm/envs.py` (it reads `os.environ` directly here because the exl3xpu image ships a modified `envs.py`), and the commits need DCO sign-off by the author.
 
