@@ -8,8 +8,9 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import PIN_MEMORY
-from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
+from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend, XpuCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
@@ -44,7 +45,9 @@ class SimpleCPUOffloadWorker:
         self.load_stream: torch.cuda.Stream | None = None
         self.store_stream: torch.cuda.Stream | None = None
 
-        self._backend = DmaCopyBackend()
+        self._backend: DmaCopyBackend | XpuCopyBackend = (
+            XpuCopyBackend() if current_platform.is_xpu() else DmaCopyBackend()
+        )
 
         # Ordered (event_idx, Event). Events pre-allocated on main thread.
         self._load_events: list[tuple[int, torch.Event]] = []
@@ -143,7 +146,13 @@ class SimpleCPUOffloadWorker:
         ]
         total_bytes_per_block = sum(per_tensor_bpb)
 
-        self.num_cpu_blocks = max(1, self.cpu_capacity_bytes // total_bytes_per_block)
+        capacity_bytes = self.cpu_capacity_bytes
+        if current_platform.is_xpu():
+            # XPU pins through PyTorch's caching host allocator, which rounds
+            # an allocation up to a power of two. The cache is one pinned
+            # buffer, kept within the largest power of two that fits.
+            capacity_bytes = 1 << (capacity_bytes.bit_length() - 1)
+        self.num_cpu_blocks = max(1, capacity_bytes // total_bytes_per_block)
 
         logger.info(
             "SimpleCPUOffloadWorker: %d unique GPU KV tensors, "
@@ -161,20 +170,41 @@ class SimpleCPUOffloadWorker:
 
         self.gpu_kv_caches = unique_gpu_caches
         self.cpu_kv_caches = {}
-        for name, gpu_tensor in unique_gpu_caches.items():
-            cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
-            # Allocate non-pinned first, then pin via cudaHostRegister to
-            # bypass PyTorch's CUDACachingHostAllocator which rounds up to
-            # the next power of 2 (e.g. 100 GB -> 128 GB).
-            tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
-            if pin_memory:
-                pin_tensor(tensor)
-            self.cpu_kv_caches[name] = tensor
+        if current_platform.is_xpu():
+            # No cudaHostRegister on XPU: one pinned buffer, sliced per tensor.
+            pool = torch.zeros(
+                self.num_cpu_blocks * total_bytes_per_block,
+                dtype=torch.int8,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            offset = 0
+            for name, gpu_tensor in unique_gpu_caches.items():
+                cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
+                nbytes = self.num_cpu_blocks * gpu_tensor.stride(0) * gpu_tensor.element_size()
+                self.cpu_kv_caches[name] = (
+                    pool[offset : offset + nbytes].view(gpu_tensor.dtype).view(cpu_shape)
+                )
+                offset += nbytes
+        else:
+            for name, gpu_tensor in unique_gpu_caches.items():
+                cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
+                # Allocate non-pinned first, then pin via cudaHostRegister to
+                # bypass PyTorch's CUDACachingHostAllocator which rounds up to
+                # the next power of 2 (e.g. 100 GB -> 128 GB).
+                tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
+                if pin_memory:
+                    pin_tensor(tensor)
+                self.cpu_kv_caches[name] = tensor
 
-        # Use lowest priority so KV cache I/O yields to compute streams.
-        low_pri, _ = torch.cuda.Stream.priority_range()
-        self.load_stream = torch.cuda.Stream(priority=low_pri)
-        self.store_stream = torch.cuda.Stream(priority=low_pri)
+        if current_platform.is_xpu():
+            self.load_stream = current_platform.Stream()
+            self.store_stream = current_platform.Stream()
+        else:
+            # Use lowest priority so KV cache I/O yields to compute streams.
+            low_pri, _ = torch.cuda.Stream.priority_range()
+            self.load_stream = torch.cuda.Stream(priority=low_pri)
+            self.store_stream = torch.cuda.Stream(priority=low_pri)
 
         # Initialize copy backend with caches and streams.
         self._backend.init(
@@ -235,7 +265,7 @@ class SimpleCPUOffloadWorker:
             if metadata.store_gpu_blocks:
                 if self._store_compute_done is None:
                     self._store_compute_done = torch.Event()
-                self._store_compute_done.record(torch.cuda.current_stream())
+                self._store_compute_done.record(current_platform.current_stream())
                 self._backend.launch_copy(
                     metadata.store_gpu_blocks,
                     metadata.store_cpu_blocks,

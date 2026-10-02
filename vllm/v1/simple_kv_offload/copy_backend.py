@@ -7,6 +7,7 @@ from __future__ import annotations
 import queue
 import threading
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -127,4 +128,123 @@ class DmaCopyBackend:
             copy_blocks(src_blocks, dst_blocks, params)
             event = torch.Event()
             event.record(stream)
+            events_list.append((event_idx, event))
+
+
+class XpuCopyBackend:
+    """Intel XPU copy backend (background thread).
+
+    XPU has no cuMemcpyBatchAsync; vLLM's ``swap_blocks_batch`` op drives the
+    copy engine with one raw pointer copy per (layer, block), the path the
+    OffloadingConnector already uses on XPU. Same interface as DmaCopyBackend.
+    """
+
+    def __init__(self) -> None:
+        self._store_params: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._load_params: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._queue: queue.SimpleQueue | None = None
+        self._thread: threading.Thread | None = None
+        self._shutdown: bool = False
+
+    @staticmethod
+    def _params(
+        src_caches: dict[str, torch.Tensor], dst_caches: dict[str, torch.Tensor]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        assert list(src_caches.keys()) == list(dst_caches.keys())
+        src_bases, dst_bases, bpb = [], [], []
+        for s, d in zip(src_caches.values(), dst_caches.values()):
+            s_bpb = s.stride(0) * s.element_size()
+            assert s_bpb == d.stride(0) * d.element_size()
+            src_bases.append(s.data_ptr())
+            dst_bases.append(d.data_ptr())
+            bpb.append(s_bpb)
+        return (
+            np.array(src_bases, dtype=np.uint64),
+            np.array(dst_bases, dtype=np.uint64),
+            np.array(bpb, dtype=np.uint64),
+        )
+
+    def init(
+        self,
+        gpu_caches: dict[str, torch.Tensor],
+        cpu_caches: dict[str, torch.Tensor],
+        device: torch.device,
+        load_stream: torch.Stream,
+        store_stream: torch.Stream,
+    ) -> None:
+        self._store_params = self._params(gpu_caches, cpu_caches)
+        self._load_params = self._params(cpu_caches, gpu_caches)
+        self._queue = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._copy_loop,
+            args=(self._queue, device, load_stream, store_stream),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def launch_copy(
+        self,
+        src_blocks: list[int],
+        dst_blocks: list[int],
+        is_store: bool,
+        event_idx: int,
+        events_list: list[tuple[int, torch.Event]],
+        wait_event: torch.Event | None = None,
+    ) -> None:
+        params = self._store_params if is_store else self._load_params
+        assert params is not None and self._queue is not None
+        self._queue.put(
+            (src_blocks, dst_blocks, params, is_store, event_idx, events_list, wait_event)
+        )
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self._shutdown = True
+        if self._queue is not None:
+            self._queue.put(None)
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+    @staticmethod
+    def _copy_loop(
+        q: queue.SimpleQueue,
+        device: torch.device,
+        load_stream: torch.Stream,
+        store_stream: torch.Stream,
+    ) -> None:
+        from vllm import _custom_ops as ops
+
+        current_platform.set_device(device)
+        # Pointer tables stay referenced until their copy's event completes.
+        in_flight: list[tuple[torch.Event, tuple[torch.Tensor, ...]]] = []
+        while True:
+            item = q.get()
+            if item is None:
+                return
+            src_blocks, dst_blocks, params, is_store, event_idx, events_list, wait_event = (
+                item
+            )
+            in_flight = [entry for entry in in_flight if not entry[0].query()]
+            stream = store_stream if is_store else load_stream
+            if wait_event is not None:
+                stream.wait_event(wait_event)
+            n = len(src_blocks)
+            tables: tuple[torch.Tensor, ...] = ()
+            if n > 0:
+                src_bases, dst_bases, bpb = params
+                src_ids = np.array(src_blocks, dtype=np.uint64)
+                dst_ids = np.array(dst_blocks, dtype=np.uint64)
+                src_all = (src_bases[:, None] + src_ids[None, :] * bpb[:, None]).ravel()
+                dst_all = (dst_bases[:, None] + dst_ids[None, :] * bpb[:, None]).ravel()
+                sizes = np.repeat(bpb, n)
+                tables = tuple(
+                    torch.from_numpy(np.ascontiguousarray(a)).view(torch.uint64)
+                    for a in (src_all, dst_all, sizes)
+                )
+                with current_platform.stream(stream):
+                    ops.swap_blocks_batch(*tables)
+            event = torch.Event()
+            event.record(stream)
+            in_flight.append((event, tables))
             events_list.append((event_idx, event))
