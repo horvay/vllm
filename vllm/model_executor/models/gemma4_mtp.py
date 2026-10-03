@@ -19,6 +19,8 @@ Checkpoint layout (``gemma4_assistant``)::
     masked_embedding.token_ordering -- token-to-centroid mapping buffer
 """
 
+import json
+import os
 from collections.abc import Iterable
 
 import torch
@@ -531,6 +533,17 @@ class Gemma4MTP(nn.Module):
         gen_cfg = draft_cfg.try_get_generation_config()
         self._suppress_token_ids = gen_cfg.get("suppress_tokens") if gen_cfg else None
 
+        # Optional pruned draft vocabulary: VLLM_GEMMA4_MTP_DRAFT_VOCAB names a
+        # JSON list of token ids. The drafter then scores only those tokens
+        # (the rest get -inf), so each draft step reads a small slice of the
+        # tied 262144-row head instead of all of it. The target still verifies
+        # with its full head, so outputs are unchanged; only acceptance can.
+        self._vocab_size = text_config.vocab_size
+        self._final_soft_cap = getattr(text_config, "final_logit_softcapping", None)
+        self._draft_vocab_path = os.environ.get("VLLM_GEMMA4_MTP_DRAFT_VOCAB")
+        self._draft_vocab_idx: torch.Tensor | None = None
+        self._draft_vocab_weight: torch.Tensor | None = None
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -579,6 +592,15 @@ class Gemma4MTP(nn.Module):
                 hidden_states,
                 self._get_full_lm_head_weight(),
             )
+        elif self._draft_vocab_idx is not None:
+            assert self._draft_vocab_weight is not None
+            sub = torch.matmul(hidden_states, self._draft_vocab_weight.t())
+            if self._final_soft_cap is not None:
+                sub = torch.tanh(sub / self._final_soft_cap) * self._final_soft_cap
+            logits = hidden_states.new_full(
+                (hidden_states.shape[0], self._vocab_size), float("-inf")
+            )
+            logits.index_copy_(1, self._draft_vocab_idx, sub.to(logits.dtype))
         else:
             logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is not None and self._suppress_token_ids:
@@ -598,4 +620,24 @@ class Gemma4MTP(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         self._stable_full_lm_head_weight = None
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if self._draft_vocab_path and self.masked_embedding is None:
+            if get_tensor_model_parallel_world_size() > 1:
+                logger.warning("Gemma4 MTP: a pruned draft vocabulary needs TP=1; ignoring it.")
+            else:
+                self._load_draft_vocab(self._draft_vocab_path)
+        return loaded
+
+    def _load_draft_vocab(self, path: str) -> None:
+        with open(path) as f:
+            ids = sorted({int(i) for i in json.load(f) if 0 <= int(i) < self._vocab_size})
+        weight = self.lm_head.weight
+        idx = torch.tensor(ids, dtype=torch.long, device=weight.device)
+        self._draft_vocab_idx = idx
+        self._draft_vocab_weight = weight.index_select(0, idx).contiguous()
+        logger.info(
+            "Gemma4 MTP: draft vocabulary pruned to %d of %d tokens (%.1f%%).",
+            len(ids),
+            self._vocab_size,
+            100.0 * len(ids) / self._vocab_size,
+        )
