@@ -2970,6 +2970,11 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+        # Read each layer's scalar once here, not inside the compiled forward:
+        # a .item() there syncs device->host and breaks XPU graph capture.
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            if hasattr(layer, "layer_scalar"):
+                layer._layer_scalar_host = float(layer.layer_scalar.item())
         return loaded_params
 
 
