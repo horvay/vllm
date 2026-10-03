@@ -3,6 +3,14 @@
 
 vLLM on an Intel Arc Pro B70 (XPU) serving Gemma 4 31B (EXL3) to many concurrent long-context chat sessions, based on upstream [`568afb3`](https://github.com/vllm-project/vllm/commit/568afb3a13806beb53bb2e6bd518269357b237c0).
 
+| Decode | Baseline | This fork |
+| --- | --- | --- |
+| 1 session | 28.9 tok/s | 46.1 tok/s |
+| 1 session, 19.5k context | 9.5 tok/s | 41.1 tok/s |
+| 8 sessions, total | 53 tok/s | 166–181 tok/s |
+
+Decode: XPU decode graphs (`FULL_DECODE_ONLY`), 2 MTP draft tokens with a pruned draft vocabulary, a 6-bit EXL3 `lm_head`, `--max-num-seqs 8`; baseline = eager decode, 3 draft tokens, bf16 head, 4 sequences.
+
 | Concurrent sessions | Median time to first token (baseline → fork) | Median decode per session | Total generation |
 | --- | --- | --- | --- |
 | 4 | 20.3 s → 1.2 s | 14 → 23.5 tok/s | 25 → 33 tok/s |
@@ -17,7 +25,9 @@ Setup: about 19.5k tokens of context per session, `--max-num-seqs 4`, 16 GiB RAM
 
 - `c22f9d8`: `VLLM_PREFIX_CACHE_REPLAY_SLACK_TOKENS` keeps sliding-window tails up to that many tokens before the replay boundary, so follow-up chat turns still hit the prefix cache under `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=0`.
 - `46e4f7b`: an XPU copy backend (`swap_blocks_batch`) for `SimpleCPUOffloadConnector`, including its lazy mode, which previously needed CUDA/HIP batch copies.
-- `af5173e`: on XPU the CPU cache is pinned in power-of-two chunks (24 GiB = 16 + 8), since PyTorch rounds each pinned allocation up to a power of two.
+- `af5173e`, `0dbd2e1`: on XPU the CPU cache is pinned in power-of-two chunks (24 GiB = 16 + 8), since PyTorch rounds each pinned allocation up to a power of two.
+- `04515cc`: Gemma 4 reads its layer scalars at load instead of with `.item()` inside the compiled forward, so XPU decode graphs capture (`1eab1a7` first imports the image's Intel `gemma4.py`).
+- `49eb1db`: `VLLM_GEMMA4_MTP_DRAFT_VOCAB` (a JSON list of token ids) limits the MTP drafter to those tokens; the target still verifies with its full head.
 
 **Enabling it**
 
@@ -28,7 +38,7 @@ vllm serve ... \
   --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":<bytes>,"lazy_offload":true}}'
 ```
 
-Keep `cpu_bytes_to_use` well under free RAM: it is pinned at startup and cannot be swapped.
+Keep `cpu_bytes_to_use` well under free RAM: it is pinned at startup and cannot be swapped. On Intel, also set `NEOReadDebugKeys=1 TreatNonUsmForTransfersAsSharedSystem=0 EnableSharedSystemUsmSupport=0`: without them the copy engine can fault reading swapped host pages while loading weights.
 
 Tested on a real B70: vLLM's prefix-caching and KV-cache-manager tests plus a new XPU copy-backend test pass, and temperature-0 outputs match within normal prefix-cache noise. Not yet proposed upstream.
 
